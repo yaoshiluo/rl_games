@@ -1,18 +1,21 @@
-import os
-import time
-import numpy as np
-from datetime import datetime
+from rl_games.algos_torch import torch_ext
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import optim
-from torch.utils.tensorboard import SummaryWriter
-
-from rl_games.algos_torch import model_builder, torch_ext
-from rl_games.common import vecenv, schedulers, experience
+from rl_games.common import vecenv
+from rl_games.common import schedulers
+from rl_games.common import experience
 from rl_games.common.a2c_common import print_statistics
-from rl_games.interfaces.base_algorithm import BaseAlgorithm
+
+from rl_games.interfaces.base_algorithm import  BaseAlgorithm
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+from rl_games.algos_torch import  model_builder
+from torch import optim
+import torch 
+from torch import nn
+import torch.nn.functional as F
+import numpy as np
+import time
+import os
 
 
 class SACAgent(BaseAlgorithm):
@@ -25,6 +28,13 @@ class SACAgent(BaseAlgorithm):
         # TODO: Get obs shape and self.network
         self.load_networks(params)
         self.base_init(base_name, config)
+
+        # ======== 新增：finetune 标志 ========
+        # 来自 train.py 里写进 config 的 is_finetune / discard_replay_buffer
+        self.is_finetune = self.config.get("is_finetune", False)
+        self.discard_replay_buffer = self.config.get("discard_replay_buffer", False)
+        # ===================================
+
         self.num_warmup_steps = config["num_warmup_steps"]
         self.gamma = config["gamma"]
         self.critic_tau = float(config["critic_tau"])
@@ -34,6 +44,7 @@ class SACAgent(BaseAlgorithm):
         self.replay_buffer_size = config["replay_buffer_size"]
         self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
         self.normalize_input = config.get("normalize_input", False)
+        print("[DEBUG] SACAgent normalize_input =", self.normalize_input)
 
         # TODO: double-check! To use bootstrap instead?
         self.max_env_steps = config.get("max_env_steps", 1000) # temporary, in future we will use other approach
@@ -56,8 +67,8 @@ class SACAgent(BaseAlgorithm):
         net_config = {
             'obs_dim': self.env_info["observation_space"].shape[0],
             'action_dim': self.env_info["action_space"].shape[0],
-            'actions_num': self.actions_num,
-            'input_shape': obs_shape,
+            'actions_num' : self.actions_num,
+            'input_shape' : obs_shape,
             'normalize_input': self.normalize_input,
         }
         self.model = self.network.build(net_config)
@@ -67,18 +78,15 @@ class SACAgent(BaseAlgorithm):
 
         self.actor_optimizer = torch.optim.Adam(self.model.sac_network.actor.parameters(),
                                                 lr=float(self.config['actor_lr']),
-                                                betas=self.config.get("actor_betas", [0.9, 0.999]),
-                                                fused=True)
+                                                betas=self.config.get("actor_betas", [0.9, 0.999]))
 
         self.critic_optimizer = torch.optim.Adam(self.model.sac_network.critic.parameters(),
                                                  lr=float(self.config["critic_lr"]),
-                                                 betas=self.config.get("critic_betas", [0.9, 0.999]),
-                                                 fused=True)
+                                                 betas=self.config.get("critic_betas", [0.9, 0.999]))
 
         self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha],
                                                     lr=float(self.config["alpha_lr"]),
-                                                    betas=self.config.get("alphas_betas", [0.9, 0.999]),
-                                                    fused=True)
+                                                    betas=self.config.get("alphas_betas", [0.9, 0.999]))
 
         self.replay_buffer = experience.VectorizedReplayBuffer(self.env_info['observation_space'].shape,
         self.env_info['action_space'].shape,
@@ -204,12 +212,29 @@ class SACAgent(BaseAlgorithm):
         return self._device
 
     def get_weights(self):
-        print("Loading weights")
-        state = {'actor': self.model.sac_network.actor.state_dict(),
-         'critic': self.model.sac_network.critic.state_dict(),
-         'critic_target': self.model.sac_network.critic_target.state_dict()}
-        if self.normalize_input:
-            state['running_mean_std'] = self.model.running_mean_std.state_dict()
+        print("Get weights for saving checkpoint")
+
+        state = {}
+
+        # 1) 给 rl-games Player / 通用使用：整套 model 的 state_dict
+        if hasattr(self.model, "state_dict"):
+            state["model"] = self.model.state_dict()
+
+        # 2) 给我们自己 + 以后调试使用：拆开的 actor / critic / critic_target
+        if hasattr(self.model, "sac_network"):
+            sac_net = self.model.sac_network
+            state["actor"] = sac_net.actor.state_dict()
+            state["critic"] = sac_net.critic.state_dict()
+            state["critic_target"] = sac_net.critic_target.state_dict()
+
+        # 3) 观测归一化参数（RunningMeanStd），如果开启了 normalize_input
+        if self.normalize_input and hasattr(self.model, "running_mean_std"):
+            state["running_mean_std"] = self.model.running_mean_std.state_dict()
+
+        # 4) replay buffer（为了继续训练不从空 buffer 开始）
+        if hasattr(self, "replay_buffer") and self.replay_buffer is not None:
+            state["replay_buffer"] = self.replay_buffer.get_state()
+
         return state
 
     def save(self, fn):
@@ -217,12 +242,32 @@ class SACAgent(BaseAlgorithm):
         torch_ext.save_checkpoint(fn, state)
 
     def set_weights(self, weights):
-        self.model.sac_network.actor.load_state_dict(weights['actor'])
-        self.model.sac_network.critic.load_state_dict(weights['critic'])
-        self.model.sac_network.critic_target.load_state_dict(weights['critic_target'])
+        # 1) 先恢复整套 model（给 Player 用的）
+        if "model" in weights and hasattr(self.model, "load_state_dict"):
+            self.model.load_state_dict(weights["model"])
 
-        if self.normalize_input and 'running_mean_std' in weights:
-            self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
+        # 2) 再细粒度覆盖 actor / critic（可以保证和老格式兼容）
+        if hasattr(self.model, "sac_network"):
+            sac_net = self.model.sac_network
+            if "actor" in weights:
+                sac_net.actor.load_state_dict(weights["actor"])
+            if "critic" in weights:
+                sac_net.critic.load_state_dict(weights["critic"])
+            if "critic_target" in weights:
+                sac_net.critic_target.load_state_dict(weights["critic_target"])
+
+        # 3) 观测归一化
+        if self.normalize_input and "running_mean_std" in weights \
+        and hasattr(self.model, "running_mean_std"):
+            self.model.running_mean_std.load_state_dict(weights["running_mean_std"])
+
+        # 4) replay buffer
+        # if "replay_buffer" in weights and hasattr(self, "replay_buffer"):
+        #     try:
+        #         self.replay_buffer.set_state(weights["replay_buffer"])
+        #     except Exception as e:
+        #         print("[WARN] Failed to restore replay_buffer:", e)
+
 
     def get_full_state_weights(self):
         print("Loading full weights")
@@ -232,7 +277,10 @@ class SACAgent(BaseAlgorithm):
         state['frame'] = self.frame
         state['actor_optimizer'] = self.actor_optimizer.state_dict()
         state['critic_optimizer'] = self.critic_optimizer.state_dict()
-        state['log_alpha_optimizer'] = self.log_alpha_optimizer.state_dict()        
+        state['log_alpha_optimizer'] = self.log_alpha_optimizer.state_dict() 
+
+        if hasattr(self.replay_buffer, "get_state"):
+            state['replay_buffer'] = self.replay_buffer.get_state()       
 
         return state
 
@@ -247,6 +295,33 @@ class SACAgent(BaseAlgorithm):
         self.critic_optimizer.load_state_dict(weights['critic_optimizer'])
         self.log_alpha_optimizer.load_state_dict(weights['log_alpha_optimizer'])
 
+        # 恢复 Replay Buffer
+        # if 'replay_buffer' in weights and hasattr(self.replay_buffer, "set_state"):
+        #     self.replay_buffer.set_state(weights['replay_buffer'])
+
+        # ====== 1) FINETUNE: 可选丢弃 replay buffer ======
+        if 'replay_buffer' in weights and hasattr(self.replay_buffer, "set_state"):
+            if self.discard_replay_buffer:
+                print("[INFO][SACAgent] Finetune mode: NOT restoring replay_buffer (start fresh).")
+                # 不调用 set_state，相当于保持当前（初始化后的）空 buffer
+            else:
+                self.replay_buffer.set_state(weights['replay_buffer'])
+
+        # ====== 2) FINETUNE: 覆盖优化器学习率 ======
+        if self.is_finetune:
+            new_actor_lr = float(self.config["actor_lr"])
+            new_critic_lr = float(self.config["critic_lr"])
+            for g in self.actor_optimizer.param_groups:
+                g["lr"] = new_actor_lr
+            for g in self.critic_optimizer.param_groups:
+                g["lr"] = new_critic_lr
+            print(f"[INFO][SACAgent] Finetune mode: override optimizer lr: "
+                  f"actor_lr={new_actor_lr}, critic_lr={new_critic_lr}")
+
+        # 恢复 obs 归一化状态
+        if self.normalize_input and 'running_mean_std' in weights:
+            self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
+
         self.last_mean_rewards = weights.get('last_mean_rewards', -1000000000)
 
         if self.vec_env is not None:
@@ -254,8 +329,7 @@ class SACAgent(BaseAlgorithm):
             self.vec_env.set_env_state(env_state)
 
     def restore(self, fn, set_epoch=True):
-        if not os.path.exists(fn):
-            raise FileNotFoundError(f"Checkpoint file not found: {fn}")
+        print("SAC restore")
         checkpoint = torch_ext.load_checkpoint(fn)
         self.set_full_state_weights(checkpoint, set_epoch=set_epoch)
 
@@ -266,7 +340,7 @@ class SACAgent(BaseAlgorithm):
         pass
 
     def get_masked_action_values(self, obs, action_masks):
-        raise NotImplementedError("Masked action values are not supported in SAC agent")
+        assert False
 
     def set_eval(self):
         self.model.eval()
@@ -330,19 +404,10 @@ class SACAgent(BaseAlgorithm):
 
         return actor_loss.detach(), entropy.detach(), self.alpha.detach(), alpha_loss # TODO: maybe not self.alpha
 
-    @torch.compile(mode="reduce-overhead")
     def soft_update_params(self, net, target_net, tau):
         for param, target_param in zip(net.parameters(), target_net.parameters()):
             target_param.data.copy_(tau * param.data +
                                     (1.0 - tau) * target_param.data)
-
-    def update_target_weights(self):
-        tau = self.critic_tau
-        self.soft_update_params(
-            self.model.sac_network.critic,
-            self.model.sac_network.critic_target,
-            tau
-        )
 
     def update(self, step):
         obs, action, reward, next_obs, done = self.replay_buffer.sample(self.batch_size)
@@ -355,15 +420,52 @@ class SACAgent(BaseAlgorithm):
         actor_loss, entropy, alpha, alpha_loss = self.update_actor_and_alpha(obs, step)
 
         actor_loss_info = actor_loss, entropy, alpha, alpha_loss
-        self.update_target_weights()
+        self.soft_update_params(self.model.sac_network.critic, self.model.sac_network.critic_target,
+                                     self.critic_tau)
         return actor_loss_info, critic1_loss, critic2_loss
+
+    # def preproc_obs(self, obs):
+    #     if isinstance(obs, dict):
+    #         obs = obs['obs']
+    #     obs = self.model.norm_obs(obs)
+
+    #     return obs
 
     def preproc_obs(self, obs):
         if isinstance(obs, dict):
-            obs = obs['obs']
+            obs = obs["obs"]
+
+        obs_before = obs.clone()
         obs = self.model.norm_obs(obs)
 
+        if not hasattr(self, "_obs_debug_step"):
+            self._obs_debug_step = 0
+            self._obs_debug_enabled = True
+
+        self._obs_debug_step += 1
+
+        PRINT_INTERVAL = 200      
+        MAX_PRINT = 10            
+
+        if self._obs_debug_enabled and (self._obs_debug_step % PRINT_INTERVAL == 0):
+            diff = (obs - obs_before).abs().max().item()
+            print("\n===== SAC Obs Normalization Debug =====")
+            print(f"Step #{self._obs_debug_step}")
+            print("normalize_input =", getattr(self.model, "normalize_input", None))
+            print("obs_before[:8] =", obs_before[0, :8].cpu().numpy())
+            print("obs_after[:8]  =", obs[0, :8].cpu().numpy())
+            print("max_abs_diff   =", diff)
+            print("Has RMS?       =", hasattr(self.model, "running_mean_std"))
+            print("=====================================\n")
+
+            # 打印次数达到 MAX_PRINT 后关闭
+            if (self._obs_debug_step // PRINT_INTERVAL) >= MAX_PRINT:
+                self._obs_debug_enabled = False
+                print("[DEBUG] disable obs normalization debug print (MAX_PRINT reached)\n")
+
         return obs
+
+
 
     def cast_obs(self, obs):
         if isinstance(obs, torch.Tensor):
@@ -386,8 +488,8 @@ class SACAgent(BaseAlgorithm):
                 upd_obs[key] = self._obs_to_tensors_internal(value)
         else:
             upd_obs = self.cast_obs(obs)
-        if not obs_is_dict or 'obs' not in obs:
-            upd_obs = {'obs': upd_obs}
+        if not obs_is_dict or 'obs' not in obs:    
+            upd_obs = {'obs' : upd_obs}
 
         return upd_obs
 
@@ -430,8 +532,7 @@ class SACAgent(BaseAlgorithm):
 
         actions = dist.sample() if sample else dist.mean
         actions = actions.clamp(*self.action_range)
-        if actions.ndim != 2:
-            raise ValueError(f"Actions tensor must be 2-dimensional, got shape {actions.shape}")
+        assert actions.ndim == 2
 
         return actions
 
@@ -450,8 +551,8 @@ class SACAgent(BaseAlgorithm):
         self.mean_rewards = self.last_mean_rewards = -1000000000
         self.algo_observer.after_clear_stats()
 
-    def play_steps(self, random_exploration=False):
-        total_time_start = time.perf_counter()
+    def play_steps(self, random_exploration = False):
+        total_time_start = time.time()
         total_update_time = 0
         total_time = 0
         step_time = 0.0
@@ -464,7 +565,8 @@ class SACAgent(BaseAlgorithm):
 
         obs = self.obs
         if isinstance(obs, dict):
-            obs = self.obs['obs']
+            # obs = self.obs['obs']
+            obs = obs['obs']
 
         next_obs_processed = obs.clone()
 
@@ -476,10 +578,11 @@ class SACAgent(BaseAlgorithm):
                 with torch.no_grad():
                     action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
 
-            step_start = time.perf_counter()
+            step_start = time.time()
+
             with torch.no_grad():
                 next_obs, rewards, dones, infos = self.env_step(action)
-            step_end = time.perf_counter()
+            step_end = time.time()
 
             self.current_rewards += rewards
             self.current_lengths += 1
@@ -502,24 +605,32 @@ class SACAgent(BaseAlgorithm):
             self.current_rewards = self.current_rewards * not_dones
             self.current_lengths = self.current_lengths * not_dones
 
-            if isinstance(next_obs, dict):    
+            # if isinstance(next_obs, dict):    
+            #     next_obs_processed = next_obs['obs']
+
+            # self.obs = next_obs.clone()
+            if isinstance(next_obs, dict):
                 next_obs_processed = next_obs['obs']
                 self.obs = next_obs_processed.clone()
             else:
+                next_obs_processed = next_obs
                 self.obs = next_obs.clone()
 
+
             rewards = self.rewards_shaper(rewards)
+
             self.replay_buffer.add(obs, action, torch.unsqueeze(rewards, 1), next_obs_processed, torch.unsqueeze(dones, 1))
 
-            if isinstance(obs, dict):
-                obs = self.obs['obs']
+            # if isinstance(obs, dict):
+            #     obs = self.obs['obs']
+            obs = next_obs_processed
+
 
             if not random_exploration:
                 self.set_train()
-
-                update_time_start = time.perf_counter()
+                update_time_start = time.time()
                 actor_loss_info, critic1_loss, critic2_loss = self.update(self.epoch_num)
-                update_time_end = time.perf_counter()
+                update_time_end = time.time()
                 update_time = update_time_end - update_time_start
 
                 self.extract_actor_stats(actor_losses, entropies, alphas, alpha_losses, actor_loss_info)
@@ -530,7 +641,7 @@ class SACAgent(BaseAlgorithm):
 
             total_update_time += update_time
 
-        total_time_end = time.perf_counter()
+        total_time_end = time.time()
         total_time = total_time_end - total_time_start
         play_time = total_time - total_update_time
 

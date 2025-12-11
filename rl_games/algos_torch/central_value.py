@@ -3,7 +3,13 @@ import copy
 import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
-from torch.amp import GradScaler
+# from torch.amp import GradScaler
+try:
+    # 新版本 torch (2.x) 推荐接口
+    from torch.amp import GradScaler  # type: ignore[attr-defined]
+except ImportError:
+    # 老版本 torch 使用 cuda.amp
+    from torch.cuda.amp import GradScaler
 import torch.distributed as dist
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd, RunningMeanStdObs

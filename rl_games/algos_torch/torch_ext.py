@@ -75,15 +75,23 @@ def safe_filesystem_op(func, *args, **kwargs):
 def safe_save(state, filename):
     return safe_filesystem_op(torch.save, state, filename)
 
+# def safe_load(filename):
+#     with torch.serialization.safe_globals({
+#         "numpy.core.multiarray.scalar": np.core.multiarray.scalar,
+#         "numpy.dtype": np.dtype,
+#         "numpy.dtypes.Float32DType": lambda: np.dtype("float32")
+#     }):
+#         # Disable weights_only to avoid the unpickler bug
+#         checkpoint = torch.load(filename, weights_only=False)
+#     return checkpoint
 def safe_load(filename):
-    with torch.serialization.safe_globals({
-        "numpy.core.multiarray.scalar": np.core.multiarray.scalar,
-        "numpy.dtype": np.dtype,
-        "numpy.dtypes.Float32DType": lambda: np.dtype("float32")
-    }):
-        # Disable weights_only to avoid the unpickler bug
-        checkpoint = torch.load(filename, weights_only=False)
-    return checkpoint
+    """
+    兼容旧版 PyTorch 的 checkpoint 加载器。
+    你的 checkpoint 是自己训练出来的，本地可信，所以不用 safe_globals，
+    直接用普通 torch.load 即可。
+    """
+    # 默认 load 到 CPU，和 rl_games 其它地方的假设一致
+    return torch.load(filename, map_location="cpu")
 
 def save_checkpoint(filename, state):
     print("=> saving checkpoint '{}'".format(filename + '.pth'))
