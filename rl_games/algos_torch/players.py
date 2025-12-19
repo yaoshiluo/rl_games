@@ -266,8 +266,7 @@ class SACPlayer(BasePlayer):
             self._printed_action_dbg = True
 
         dist = self.model.actor(obs)
-        # 注意：这里保持原来的逻辑，不改语义（虽然名字有点反直觉）
-        actions = dist.sample() if is_deterministic else dist.mean
+        actions = dist.sample() if not is_deterministic else dist.mean
         actions = actions.clamp(*self.action_range).to(self.device)
 
         if self.has_batch_dimension == False:

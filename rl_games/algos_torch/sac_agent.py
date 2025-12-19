@@ -242,6 +242,11 @@ class SACAgent(BaseAlgorithm):
         torch_ext.save_checkpoint(fn, state)
 
     def set_weights(self, weights):
+
+        # if "log_alpha" in weights and hasattr(self, "log_alpha"):
+        #     with torch.no_grad():
+        #         self.log_alpha.data.copy_(weights["log_alpha"].to(self._device))
+
         # 1) 先恢复整套 model（给 Player 用的）
         if "model" in weights and hasattr(self.model, "load_state_dict"):
             self.model.load_state_dict(weights["model"])
@@ -278,6 +283,7 @@ class SACAgent(BaseAlgorithm):
         state['actor_optimizer'] = self.actor_optimizer.state_dict()
         state['critic_optimizer'] = self.critic_optimizer.state_dict()
         state['log_alpha_optimizer'] = self.log_alpha_optimizer.state_dict() 
+        # state['log_alpha'] = self.log_alpha.detach().to('cpu')
 
         if hasattr(self.replay_buffer, "get_state"):
             state['replay_buffer'] = self.replay_buffer.get_state()       
@@ -308,19 +314,19 @@ class SACAgent(BaseAlgorithm):
                 self.replay_buffer.set_state(weights['replay_buffer'])
 
         # ====== 2) FINETUNE: 覆盖优化器学习率 ======
-        if self.is_finetune:
-            new_actor_lr = float(self.config["actor_lr"])
-            new_critic_lr = float(self.config["critic_lr"])
-            for g in self.actor_optimizer.param_groups:
-                g["lr"] = new_actor_lr
-            for g in self.critic_optimizer.param_groups:
-                g["lr"] = new_critic_lr
-            print(f"[INFO][SACAgent] Finetune mode: override optimizer lr: "
-                  f"actor_lr={new_actor_lr}, critic_lr={new_critic_lr}")
+        # if self.is_finetune:
+        #     new_actor_lr = float(self.config["actor_lr"])
+        #     new_critic_lr = float(self.config["critic_lr"])
+        #     for g in self.actor_optimizer.param_groups:
+        #         g["lr"] = new_actor_lr
+        #     for g in self.critic_optimizer.param_groups:
+        #         g["lr"] = new_critic_lr
+        #     print(f"[INFO][SACAgent] Finetune mode: override optimizer lr: "
+        #           f"actor_lr={new_actor_lr}, critic_lr={new_critic_lr}")
 
         # 恢复 obs 归一化状态
-        if self.normalize_input and 'running_mean_std' in weights:
-            self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
+        # if self.normalize_input and 'running_mean_std' in weights:
+        #     self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
 
         self.last_mean_rewards = weights.get('last_mean_rewards', -1000000000)
 
@@ -366,6 +372,22 @@ class SACAgent(BaseAlgorithm):
         critic1_loss = self.c_loss(current_Q1, target_Q)
         critic2_loss = self.c_loss(current_Q2, target_Q)
         critic_loss = critic1_loss + critic2_loss 
+
+        # ===== DEBUG: Q statistics =====
+        if step % 100 == 0:   
+            with torch.no_grad():
+                q1_mean = current_Q1.mean().item()
+                q2_mean = current_Q2.mean().item()
+                target_q_mean = target_Q.mean().item()
+                q_gap = (current_Q1 - current_Q2).abs().mean().item()
+
+            print(
+                f"[Q DEBUG][step {step}] "
+                f"Q1={q1_mean:.3f} "
+                f"Q2={q2_mean:.3f} "
+                f"TargetQ={target_q_mean:.3f} "
+                f"|Q1-Q2|={q_gap:.3f}"
+            )
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_optimizer.step()
@@ -658,6 +680,8 @@ class SACAgent(BaseAlgorithm):
         # rep_count = 0
 
         self.obs = self.env_reset()
+        #添加自己的buffer
+        # self.maybe_prefill_replay_buffer()
 
         while True:
             self.epoch_num += 1
@@ -744,3 +768,137 @@ class SACAgent(BaseAlgorithm):
 
                 if should_exit:
                     return self.last_mean_rewards, self.epoch_num
+
+    def _check_offline_dataset(self, obs, actions, rewards, next_obs, dones):
+        # ---- shape checks ----
+        assert obs.ndim == 2, f"obs must be (T, obs_dim), got {obs.shape}"
+        assert next_obs.ndim == 2, f"next_obs must be (T, obs_dim), got {next_obs.shape}"
+        assert actions.ndim == 2, f"actions must be (T, act_dim), got {actions.shape}"
+        T = obs.shape[0]
+        assert next_obs.shape[0] == T, "next_obs length mismatch"
+        assert actions.shape[0] == T, "actions length mismatch"
+        assert rewards.shape[0] == T, "rewards length mismatch"
+        assert dones.shape[0] == T, "dones length mismatch"
+
+        # ---- dim checks against env_info ----
+        obs_dim = self.env_info["observation_space"].shape[0]
+        act_dim = self.env_info["action_space"].shape[0]
+        assert obs.shape[1] == obs_dim, f"obs_dim mismatch: data {obs.shape[1]} vs env {obs_dim}"
+        assert next_obs.shape[1] == obs_dim, f"next_obs_dim mismatch: data {next_obs.shape[1]} vs env {obs_dim}"
+        assert actions.shape[1] == act_dim, f"act_dim mismatch: data {actions.shape[1]} vs env {act_dim}"
+
+        # ---- finite checks ----
+        assert np.isfinite(obs).all(), "obs contains NaN/Inf"
+        assert np.isfinite(next_obs).all(), "next_obs contains NaN/Inf"
+        assert np.isfinite(actions).all(), "actions contains NaN/Inf"
+        assert np.isfinite(rewards).all(), "rewards contains NaN/Inf"
+        assert np.isfinite(dones).all(), "dones contains NaN/Inf"
+
+        # ---- dones sanity ----
+        # allow {0,1} (float/bool/uint8)
+        u = np.unique(dones)
+        # dones may be float; tolerate small numerical noise
+        if not ((u.min() >= -1e-6) and (u.max() <= 1.0 + 1e-6)):
+            raise ValueError(f"dones values out of range [0,1]: min={u.min()}, max={u.max()}")
+
+        # ---- quick stats ----
+        print("[OFFLINE DATA] T =", T)
+        print("[OFFLINE DATA] rewards: mean =", float(rewards.mean()), "std =", float(rewards.std()),
+            "min =", float(rewards.min()), "max =", float(rewards.max()))
+        print("[OFFLINE DATA] dones:   mean =", float(dones.mean()),
+            "(fraction done if 0/1)")
+
+    def load_replay_from_npz(self, npz_path: str, limit: int = -1, clear_existing: bool = False):
+        """
+        Load offline dataset transitions into SAC replay buffer.
+
+        IMPORTANT for your sim->real finetune:
+        - This function DOES NOT update RunningMeanStd (RMS). Keep sim RMS and let it adapt online.
+        """
+        data = np.load(npz_path)
+
+        obs = data["obs"].astype(np.float32)
+        actions = data["actions"].astype(np.float32)
+        rewards = data["rewards"].astype(np.float32)
+        next_obs = data["next_obs"].astype(np.float32)
+        dones = data["dones"]
+
+        # shape normalize to (T,1) for rewards/dones
+        if rewards.ndim == 1:
+            rewards = rewards[:, None]
+        if dones.ndim == 1:
+            dones = dones[:, None]
+
+        # convert dones to float {0,1}
+        if dones.dtype != np.float32:
+            dones = dones.astype(np.float32)
+
+        T = obs.shape[0]
+        if limit > 0:
+            T = min(T, limit)
+            obs = obs[:T]
+            actions = actions[:T]
+            rewards = rewards[:T]
+            next_obs = next_obs[:T]
+            dones = dones[:T]
+
+        # validate dataset (strongly recommended)
+        self._check_offline_dataset(obs, actions, rewards, next_obs, dones)
+
+        # optionally clear buffer first
+        if clear_existing:
+            # VectorizedReplayBuffer in rl_games often supports reset/clear; if not, re-create it
+            if hasattr(self.replay_buffer, "reset"):
+                self.replay_buffer.reset()
+                print("[INFO] replay_buffer.reset() called")
+            else:
+                # safest fallback: re-create buffer with same params
+                from rl_games.common import experience
+                self.replay_buffer = experience.VectorizedReplayBuffer(
+                    self.env_info['observation_space'].shape,
+                    self.env_info['action_space'].shape,
+                    self.replay_buffer_size,
+                    self._device
+                )
+                print("[INFO] replay_buffer re-created (no reset() method found)")
+
+        # to torch on correct device
+        obs_t  = torch.from_numpy(obs).to(self._device)
+        act_t  = torch.from_numpy(actions).to(self._device)
+        rew_t  = torch.from_numpy(rewards).to(self._device)
+        nxt_t  = torch.from_numpy(next_obs).to(self._device)
+        done_t = torch.from_numpy(dones).to(self._device)
+
+        # feed into replay buffer in chunks
+        chunk = 4096
+        for i in range(0, T, chunk):
+            j = min(T, i + chunk)
+            self.replay_buffer.add(
+                obs_t[i:j],
+                act_t[i:j],
+                rew_t[i:j],
+                nxt_t[i:j],
+                done_t[i:j],
+            )
+
+        print(f"[INFO] Loaded {T} offline transitions into replay buffer from: {npz_path}")
+
+    def maybe_prefill_replay_buffer(self):
+        """
+        Call once at the beginning of training (after env_info/replay_buffer are created).
+        Controlled via config keys:
+        - offline_buffer_path
+        - offline_buffer_limit
+        - offline_buffer_clear_existing
+        """
+        path = self.config.get("offline_buffer_path", "")
+        if not path:
+            return
+
+        limit = int(self.config.get("offline_buffer_limit", -1))
+        clear_existing = bool(self.config.get("offline_buffer_clear_existing", False))
+        self.load_replay_from_npz(path, limit=limit, clear_existing=clear_existing)
+
+        # For real finetune: do NOT random explore warmup if offline data exists
+        if int(self.config.get("num_warmup_steps", 0)) > 0:
+            print("[INFO] Offline buffer provided: set num_warmup_steps=0 recommended for real finetune.")
