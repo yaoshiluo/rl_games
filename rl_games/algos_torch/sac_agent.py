@@ -74,6 +74,25 @@ class SACAgent(BaseAlgorithm):
         self.model = self.network.build(net_config)
         self.model.to(self._device)
 
+        # ======== Warmstart actor from BC checkpoint (optional) ========
+        bc_path = self.config.get("warmstart_bc_ckpt", "")
+        # 如果你是 resume（load_checkpoint=True），通常不希望被 BC 覆盖
+        if bc_path and not self.config.get("load_checkpoint", False):
+            bc_path = os.path.abspath(bc_path)
+            print(f"[Warmstart] Loading BC actor from: {bc_path}")
+
+            bc_ckpt = torch.load(bc_path, map_location=self._device)
+
+            # 你已验证 STRICT-LOAD COMPATIBLE=True，所以 strict=True
+            self.model.sac_network.actor.load_state_dict(bc_ckpt["actor"], strict=True)
+
+            # RMS（若 normalize_input=True 且 BC 保存了 RMS）
+            if "running_mean_std" in bc_ckpt and hasattr(self.model, "running_mean_std"):
+                self.model.running_mean_std.load_state_dict(bc_ckpt["running_mean_std"], strict=True)
+
+            print("[Warmstart] BC actor (+RMS) loaded successfully.")
+        # =============================================================
+
         print("Number of Agents", self.num_actors, "Batch Size", self.batch_size)
 
         self.actor_optimizer = torch.optim.Adam(self.model.sac_network.actor.parameters(),
